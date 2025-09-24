@@ -1,0 +1,13 @@
+# we do not want to commit these items:
+# training data, any .pyc files, any __pycache__ files, any wandb files
+# .vscode files .DS_Store, checkpoints (for now), test outputs (for now)
+# everything else should be committed
+
+/training_data
+*.pyc
+__pycache__
+wandb
+.vscode
+checkpoints
+test_outputs
+.DS_Store

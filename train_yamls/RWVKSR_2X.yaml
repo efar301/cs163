@@ -1,0 +1,35 @@
+seed: 12
+device: null
+
+model:
+  name: RWKVSR
+  scale: 2
+  in_channels: 3
+  num_channels: 64
+  num_blocks: 4
+  # embed_dim: 256
+  checkpoint_dir: ./checkpoints/2X_RWKVSR
+
+optimizer:
+  name: adam
+  lr: 0.001
+  betas: [0.9, 0.99]
+
+data:
+  train_datasets: ['DIV2K', 'Flickr2K']
+  train_dataset_dirs: [./training_data/DIV2K_train_HR, ./training_data/Flickr2K]
+  scale: 2
+  patch_size: [48, 48]
+  batch_size: 32 # may need to change based on gpu memory
+  num_workers: 4 # may need to change based on gpu memory
+  pin_memory: false
+
+trainer:
+  num_epochs: 20
+  log_freq: 1
+  resume: false
+
+wandb:
+  entity: farns
+  project: RWKVSR
+  run_name: rwkvsr_2x
