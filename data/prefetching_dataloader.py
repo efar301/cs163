@@ -21,17 +21,20 @@ class DataPrefetcher():
         self.dataiter = iter(loader)
         self.stream = torch.cuda.Stream() if self.device.type == 'cuda' else None
         self.__preload__()
+        print(f'data prefetcher using device: {self.device}')
+        print('data prefetcher initialized successfully')
 
     def __preload__(self) -> None:
         try:
-            self.hr, self.lr = next(self.dataiter)
+            self.lr, self.hr = next(self.dataiter)
         except StopIteration:
             self.dataiter = iter(self.loader)
-            self.hr, self.lr = next(self.dataiter)
+            self.lr, self.hr = next(self.dataiter)
 
         if self.stream is not None:
-            self.hr = self.hr.cuda(non_blocking=True)
-            self.lr = self.lr.cuda(non_blocking=True)
+            with torch.cuda.stream(self.stream):
+                self.hr = self.hr.cuda(non_blocking=True)
+                self.lr = self.lr.cuda(non_blocking=True)
         else:
             self.hr = self.hr.to(self.device)
             self.lr = self.lr.to(self.device)

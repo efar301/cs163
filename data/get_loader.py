@@ -7,9 +7,12 @@ from .prefetching_dataloader import DataPrefetcher
 from typing import Tuple, Optional
 
 def get_loader(image_directories: list, scale: int, patch_size: Tuple[int, int], batch_size: int, 
-               device: Optional[str], num_workers: int, pin_memory: bool) -> DataPrefetcher:
+               device: Optional[str], num_workers: int, persistent_workers: bool, 
+               pin_memory: bool, prefetch_factor: int) -> DataPrefetcher:
     data_class = Paired_Dataset(image_directories, scale, patch_size)
-    dataloader = DataLoader(data_class, batch_size, num_workers=num_workers, pin_memory=pin_memory, shuffle=True)
+    dataloader = DataLoader(data_class, batch_size, num_workers=num_workers, persistent_workers=persistent_workers, 
+                            pin_memory=pin_memory, shuffle=True, prefetch_factor=prefetch_factor)
     prefetcher = DataPrefetcher(dataloader, device=device)
+    print(f'dataloader created successfully')
     return prefetcher
 

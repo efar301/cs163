@@ -49,8 +49,8 @@ class Paired_Dataset(Dataset):
 
         # bicubically downscale the hr image to the patch size
         lr_tensor = T.Resize(self.patch_size, interpolation=InterpolationMode.BICUBIC)(hr_tensor)
-        return torch.clamp(hr_tensor, 0, 1), torch.clamp(lr_tensor, 0, 1)
+        return torch.clamp(lr_tensor, 0, 1), torch.clamp(hr_tensor, 0, 1)
 
 
 
-            
+             

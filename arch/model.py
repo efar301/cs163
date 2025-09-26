@@ -11,11 +11,12 @@ class ResBlock(nn.Module):
             nn.SiLU(),
             nn.Conv2d(in_channels=num_channels, out_channels=num_channels, kernel_size=3, padding=1, stride=1),
         )
+        self.beta = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
     
     def forward(self, x):
         res = x
         x = self.ff(x)
-        x = x + res
+        x = x + self.beta * res
         return x
 
 class RWKVSR(nn.Module):
@@ -38,13 +39,14 @@ class RWKVSR(nn.Module):
         for block in self.blocks:
             x = block(x)
 
+        x = x + res
         x = self.pre_upscale(x)
         x = self.upscale(x)
-        return x
+        return x.clamp(0, 1)
 
 if __name__ == '__main__':
     model = RWKVSR(2, 3, 64, 8)
-    test = torch.randn(3, 100, 100)
+    test = torch.randn(1, 3, 100, 100)
 
     out = model(test)
     print(test.shape, out.shape)

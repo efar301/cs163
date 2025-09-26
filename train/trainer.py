@@ -7,6 +7,7 @@ from data.get_loader import get_loader
 import yaml
 from arch.model import RWKVSR
 from typing import Optional, Dict, Any
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 
@@ -24,10 +25,15 @@ class Trainer():
                                      self.config['data']['batch_size'],
                                      self.device,
                                      self.config['data']['num_workers'],
-                                     self.config['data']['pin_memory'])
+                                     self.config['data']['persist_workers'],
+                                     self.config['data']['pin_memory'],
+                                     self.config['data']['prefetch_factor']
+                                     )
+
         
         
         self.checkpoint_dir = self.config['model']['checkpoint_dir']
+        self.checkpoint_freq = self.config['trainer']['checkpoint_freq']
         self.log_freq = self.config['trainer']['log_freq']
         self.checkpoint_dir = self.config['model']['checkpoint_dir']
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -37,8 +43,10 @@ class Trainer():
         self.model = self._init_model()
         self.optimizer = self._init_optimizer()
         self.criterion = nn.L1Loss()
+        self._setup_amp()
 
-        self._log_init()
+        if self.config['trainer']['logging']:
+            self._log_init()
 
         resume_path = None
         if self.config['trainer']['resume']:
@@ -93,22 +101,46 @@ class Trainer():
         name = opt_config['name'].lower()
         if name == 'adam':
             betas = tuple(opt_config.get('betas'))
+            print(f'optimizer: {name} initialized successfully')
             return torch.optim.Adam(self.model.parameters(), 
                                     lr=opt_config['lr'], 
                                     betas=betas)
-        return ValueError(f'Optimizer not defined in _init_optimizer(): {opt_config['name']}')
+        
+        raise ValueError(f"Optimizer not defined in _init_optimizer(): {opt_config['name']}")
 
     def _log_init(self) -> None:
         self.run = wandb.init(config={**self.config['wandb']})
         wandb.watch(self.model, log='gradients', log_freq=self.config['trainer']['log_freq'])
+        print('wandb initialized successfully')
 
     def log(self, loss: float, lr: float) -> None:
         self.run.log({'loss': loss, 'lr': lr})
-        
-    def train(self):
+
+    def _setup_amp(self) -> None:
+        dt = self.device.type
+        self.autocast_device = dt
+        self.scaler = None
+
+        if dt == 'cuda':
+            use_bf16 = torch.cuda.is_bf16_supported()
+            self.autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
+            print(f'using cuda autocast with dtype: {self.autocast_dtype}')
+            self.scaler = torch.amp.GradScaler('cuda', enabled=not use_bf16)
+        elif dt == 'mps':
+            self.autocast_dtype = torch.float16
+            self.scaler = None
+            print('using mps autocast with dtype: torch.float16')
+        else:
+            self.autocast_dtype = torch.float32
+            self.scaler = None
+            print('using cpu autocast with dtype: torch.float32')
+
+
+    def train(self) -> None:
         num_parameters = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f'model has {num_parameters} trainable parameters')
-        print(f'training on {self.device}')
+        print(f'device used for training: {self.device}')
+        print('starting training...')
         num_epochs = self.config['trainer']['num_epochs']
 
         for epoch in range(self.start_epoch, num_epochs):
@@ -116,22 +148,38 @@ class Trainer():
             progress = tqdm(range(len(self.dataloader)), desc=f'Epoch {epoch + 1}/{num_epochs}')
             for _ in progress:
                 lr, hr = self.dataloader.next()
-                preds = self.model(lr)
-                loss = self.criterion(preds, hr)
+
+                with torch.amp.autocast(device_type=self.autocast_device, dtype=self.autocast_dtype):
+                    preds = self.model(lr)
+                    loss = self.criterion(preds, hr)
 
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+
+                if self.scaler:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
 
                 self.global_step += 1
                 current_lr = self.optimizer.param_groups[0]['lr']
                 
                 if self.global_step % self.log_freq == 0:
-                    self.log(loss.item(), current_lr)
-                
-                progress.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{current_lr:.4f}'})
+                    if self.config['trainer']['logging']:
+                        self.log(loss.item(), current_lr)
+                    progress.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{current_lr:.4f}'})
             
-            self.checkpoint(epoch)
+            if self.global_step % self.checkpoint_freq == 0:
+                self.checkpoint(epoch)
+        # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        #     for _ in range(30):  # warmup a bit
+        #         lr, hr = self.dataloader.next()
+        #         with torch.autocast(device_type=self.autocast_device, dtype=self.autocast_dtype):
+        #             preds = self.model(lr); loss = self.criterion(preds, hr)
+        #         self.optimizer.zero_grad(set_to_none=True); loss.backward(); self.optimizer.step()
+        # print(prof.key_averages().table(sort_by="self_cpu_time_total"))
 
     def checkpoint(self, epoch: int) -> None:
         state = {
@@ -144,6 +192,7 @@ class Trainer():
 
         path = self.checkpoint_dir + '/' + f'epoch_{epoch + 1}.pt'
         torch.save(state, path)
+        print(f'checkpoint saved at {path} successfully')
     
     def _load_checkpoint(self, checkpoint_dir: str) -> None:
         checkpoint = torch.load(checkpoint_dir, map_location=self.device)
@@ -151,6 +200,7 @@ class Trainer():
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.start_epoch = checkpoint.get("epoch", 0)
         self.global_step = checkpoint.get("global_step", 0)
+        print(f'checkpoint loaded from {checkpoint_dir} successfully, resuming from epoch {self.start_epoch}')
 
 
 
