@@ -1,39 +1,58 @@
 seed: 12
 device: null
 
-model:
+model: # v2 had embed_dim: 48, num_heads: 6
   name: RWKVSR
   scale: 2
   in_channels: 3
   num_channels: 64
-  num_blocks: 16
-  # embed_dim: 256
-  checkpoint_dir: ./checkpoints/2X_RWKVSR
+  blocks_per_layer: 6
+  residual_groups: 4
+  resi_connection: 3conv
+  upsampler: pixelshuffledirect
+  embed_dim: 48
+  # num_heads: 6
+  patch_size: 8
+
+  checkpoint_dir: ./checkpoints/2X_RWKV6_3SR
 
 optimizer:
   name: adam
-  lr: 0.0001
+  lr: 0.0002
   betas: [0.9, 0.99]
+
+  # name: adamw
+  # lr: 0.0002
+  # betas: [0.9, 0.99]
+  # weight_decay: 0.001
+  
+
+
+scheduler:
+  lr_milestones: [250000, 400000, 450000, 475000]
+  lr_gamma: 0.5
 
 data:
   train_datasets: ['DIV2K', 'Flickr2K']
   train_dataset_dirs: [./training_data/DIV2K_train_HR, ./training_data/Flickr2K]
   scale: 2
   patch_size: [48, 48]
-  batch_size: 64 # may need to change based on gpu memory
-  num_workers: 8 # may need to change based on gpu memory
+  batch_size: 16 # may need to change based on gpu memory
+  num_workers: 4 # may need to change based on gpu memory
   persist_workers: true
   pin_memory: true
   prefetch_factor: 4
 
 trainer:
-  num_epochs: 300
+  num_iterations: 500000
   log_freq: 100
-  logging: false
-  checkpoint_freq: 1
+  logging: true
+  checkpoint_freq: 5000
   resume: false
 
 wandb:
-  entity: farns
+  entity: farns301
   project: RWKVSR
   run_name: rwkvsr_2x
+  resume: allow
+  id: 'run_6_2x'
