@@ -8,8 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.layers import to_2tuple, trunc_normal_
-from arch.wkv_4.vrwkv_4_2 import Block as RWKV
-
+from arch.wkv_4.vrwkv_4_8 import Block as RWKV
+from einops import rearrange
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -29,17 +29,65 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+# ESA from HNCT
+class ESA(nn.Module):
+    def __init__(self, n_feats, conv):
+        super(ESA, self).__init__()
+        f = n_feats // 4
+        self.conv1 = conv(n_feats, f, kernel_size=1)
+        self.conv_f = conv(f, f, kernel_size=1)
+        self.conv_max = conv(f, f, kernel_size=3, padding=1)
+        self.conv2 = conv(f, f, kernel_size=3, stride=2, padding=0)
+        self.conv3 = conv(f, f, kernel_size=3, padding=1)
+        self.conv3_ = conv(f, f, kernel_size=3, padding=1)
+        self.conv4 = conv(f, n_feats, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        c1_ = (self.conv1(x))
+        c1 = self.conv2(c1_)
+        v_max = F.max_pool2d(c1, kernel_size=7, stride=3)
+        v_range = self.relu(self.conv_max(v_max))
+        c3 = self.relu(self.conv3(v_range))
+        c3 = self.conv3_(c3)
+        c3 = F.interpolate(c3, (x.size(2), x.size(3)), mode='bilinear', align_corners=False)
+        cf = self.conv_f(c1_)
+        c4 = self.conv4(c3 + cf)
+        m = self.sigmoid(c4)
+
+        return x * m
+
+# class ChannelShuffle(nn.Module):
+#     def __init__(self, groups: int):
+#         super().__init__()
+#         assert groups > 0, "groups must be > 0"
+#         self.groups = groups
+
+#     def forward(self, x, patch_resolution):
+#         B, T, C = x.shape
+#         H, W = patch_resolution
+#         g = self.groups
+#         assert C % self.groups == 0 
+
+#         x = rearrange(x, 'b (h w) c -> b h w c', h=H, w=W)
+#         x = rearrange(x, 'b h w (g c2) -> b g c2 h w', g=g)
+#         x = x.transpose(1, 2).contiguous()
+#         x = rearrange(x, 'b c2 g h w -> b h w (g c2)')
+#         x = rearrange(x, 'b h w c -> b (h w) c')
+#         return x.contiguous()
+
 class RWKVBlock(nn.Module):  # Add CNN block here for the RWKV improevment
     def __init__(self, dim, input_resolution, n_layer, layer_id, shift_mode='q_shift', init_mode='local',
                 channel_gamma=1/4, shift_pixel=1, drop_path=0., hidden_rate=4,
-                init_values=None, post_norm=False, k_norm=False, with_cp=False,
-                mlp_ratio=4., drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                init_values=None, post_norm=False, key_norm=False, with_cp=False,
+                mlp_ratio=3., drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         
         self.RWKV = RWKV(n_embd=dim, n_layer=n_layer, layer_id=layer_id, channel_gamma=channel_gamma, shift_mode=shift_mode, init_mode=init_mode,
                         shift_pixel=shift_pixel, drop_path=drop_path, hidden_rate=hidden_rate,
-                        init_values=init_values, post_norm=post_norm, k_norm=k_norm, with_cp=with_cp)
-        # self.RWKV = RWKV(n_embd=dim, n_layer=n_layer, layer_id=layer_id, hidden_rate=4, init_mode='fancy', key_norm=key_norm)
+                        init_values=init_values, post_norm=post_norm, key_norm=key_norm, with_cp=with_cp)
+        # self.RWKV = RWKV(n_embd=dim, n_layer=n_layer, layer_id=layer_id, hidden_rate=4, init_mode='local', key_norm=key_norm)
     def forward(self, x, patch_resolution):
         # RWKV
         x = self.RWKV(x, patch_resolution)
@@ -48,11 +96,11 @@ class RWKVBlock(nn.Module):  # Add CNN block here for the RWKV improevment
         return x
         
 
-class BasicLayer(nn.Module): #
+class BasicLayer(nn.Module): 
     def __init__(self, dim, input_resolution, depth, n_layer, layer_id, shift_mode='q_shift', init_mode='local',
                 channel_gamma=1/4, shift_pixel=1, drop_path=0., hidden_rate=4,
-                init_values=None, post_norm=False, k_norm=False, with_cp=False,
-                mlp_ratio=4., drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
+                init_values=None, post_norm=False, key_norm=False, with_cp=False,
+                mlp_ratio=3., drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
 
         super().__init__()
         self.dim = dim
@@ -66,7 +114,7 @@ class BasicLayer(nn.Module): #
                     shift_mode=shift_mode, init_mode=init_mode, channel_gamma=channel_gamma, shift_pixel=shift_pixel,
                     drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path, 
                     hidden_rate=hidden_rate, init_values=init_values,
-                    post_norm=post_norm, k_norm=k_norm, with_cp=with_cp,
+                    post_norm=post_norm, key_norm=key_norm, with_cp=with_cp,
                     mlp_ratio=mlp_ratio, drop=drop, act_layer=act_layer, norm_layer=norm_layer)
             for i in range(depth)])
         
@@ -91,8 +139,8 @@ class BasicLayer(nn.Module): #
 class RWKVB(nn.Module):
     def __init__(self, dim, input_resolution, depth, n_layer, layer_id, shift_mode='q_shift', init_mode='local',
                 channel_gamma=1/4, shift_pixel=1, drop_path=0., hidden_rate=4,
-                init_values=None, post_norm=False, k_norm=False, with_cp=False,
-                mlp_ratio=4., drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
+                init_values=None, post_norm=False, key_norm=False, with_cp=False,
+                mlp_ratio=3., drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
                 img_size=224, patch_size=4, resi_connection='1conv'):
         super(RWKVB, self).__init__()
 
@@ -107,7 +155,7 @@ class RWKVB(nn.Module):
                                          channel_gamma=channel_gamma, shift_pixel=shift_pixel,
                                          drop_path=drop_path, hidden_rate=hidden_rate,
                                          init_values=init_values, post_norm=post_norm,
-                                         k_norm=k_norm, with_cp=with_cp,
+                                         key_norm=key_norm, with_cp=with_cp,
                                          mlp_ratio=mlp_ratio, drop=drop, act_layer=act_layer,
                                          norm_layer=norm_layer,
                                          downsample=downsample,
@@ -130,15 +178,23 @@ class RWKVB(nn.Module):
             img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim,
             norm_layer=None)
 
+        self.esa = ESA(dim, nn.Conv2d)
+
     def forward(self, x, x_size):  # x_size need to be used
-        return self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x, x_size), x_size))) + x
+        # return self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x, x_size), x_size))) + x
+        shortcut = x
+        x = self.residual_group(x, x_size)
+        x = self.patch_unembed(x, x_size)
+        x = self.esa(x)
+        x = self.patch_embed(x) + shortcut
+        return x
 
 class RWKVIR(nn.Module):
     def __init__(self, img_size=64, patch_size=1, in_chans=3,
-                 embed_dim=64, depths=[6, 6, 6, 6], mlp_ratio=4.,
+                 embed_dim=64, depths=[6, 6, 6, 6], mlp_ratio=3.,
                  shift_mode='q_shift', init_mode='local',
                  channel_gamma=1/4, shift_pixel=1, hidden_rate=4,
-                 init_values=None, post_norm=False, k_norm=False, with_cp=False,
+                 init_values=None, post_norm=False, key_norm=False, with_cp=False,
                  drop_rate=0.0, drop_path_rate=0.0, act_layer=nn.GELU,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
                  use_checkpoint=False, upscale=2, img_range=1., upsampler='', resi_connection='1conv',
@@ -210,7 +266,7 @@ class RWKVIR(nn.Module):
                          channel_gamma=channel_gamma, shift_pixel=shift_pixel, 
                          hidden_rate=hidden_rate,
                          init_values=init_values, post_norm=post_norm, 
-                         k_norm=k_norm, with_cp=with_cp,
+                         key_norm=key_norm, with_cp=with_cp,
                          mlp_ratio=self.mlp_ratio,
                          act_layer=nn.GELU, norm_layer=norm_layer, 
                          downsample=None, use_checkpoint=use_checkpoint,
@@ -466,7 +522,7 @@ class UpsampleOneStep(nn.Sequential):
 # import numpy as np
 
 if __name__ == '__main__':
-    upscale = 4
+    upscale = 2
     height = 100
     width = 200
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -481,7 +537,7 @@ if __name__ == '__main__':
     print(pred.shape)
     print("x on:", x.device)
     print("model param on:", next(model.parameters()).device)
-    print(f"number of model parameters: {sum(param.numel() for param in model.parameters())/1e6}M")
+    print(f"number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 #     img_lq = np.empty([3,64,64], dtype = float, order = 'C')
 #     x = torch.from_numpy(img_lq).float().unsqueeze(0).to('cuda')
 #     flops = FlopCountAnalysis(model, x)
