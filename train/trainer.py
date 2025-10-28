@@ -6,6 +6,7 @@ from tqdm import tqdm
 from data.get_loader import get_loader
 import yaml
 from arch.rwkv4sr import RWKVIR
+# from arch.rwkv6sr import RWKVIR
 from typing import Optional, Dict, Any
 from torch.profiler import profile, record_function, ProfilerActivity
 from torcheval.metrics import PeakSignalNoiseRatio
@@ -14,9 +15,14 @@ import torchvision.transforms as T
 import torch.nn.functional as F
 
 
+torch.backends.cudnn.benchmark = True              
+torch.backends.cuda.matmul.allow_tf32 = True       
+torch.backends.cudnn.allow_tf32 = True
+
 class Trainer():
     def __init__(self, config_dir: str) -> None:
         self.config = self._load_config(config_dir)
+        self._seed_everything(self.config['seed'])
         
         self.train_datasets = self.config['data']['train_dataset_dirs']
 
@@ -60,8 +66,9 @@ class Trainer():
         if resume_path:
             self._load_checkpoint(resume_path)
 
-
-
+    def _seed_everything(self, seed: int):
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
     @staticmethod
     def _load_config(config_dir: str) -> Dict[str, Any]:
@@ -100,7 +107,6 @@ class Trainer():
             depths=depths,
             mlp_ratio=3.,
             patch_size=model_config['patch_size'],
-            img_range=1,
             embed_dim=model_config['embed_dim'],
             upscale=model_config['scale'],
             upsampler=model_config['upsampler'],
@@ -203,19 +209,19 @@ class Trainer():
             self.model.train()
 
             lr, hr = self.dataloader.next()
-            # with torch.amp.autocast(device_type=self.autocast_device, dtype=self.autocast_dtype):
-            preds = self.model(lr)
-            loss = self.criterion(preds, hr)
+            with torch.amp.autocast(device_type=self.autocast_device, dtype=self.autocast_dtype):
+                preds = self.model(lr)
+                loss = self.criterion(preds, hr)
 
             self.optimizer.zero_grad()
 
-            # if self.scaler:
-            #     self.scaler.scale(loss).backward()
-            #     self.scaler.step(self.optimizer)
-            #     self.scaler.update()
-            # else:
-            loss.backward()
-            self.optimizer.step()
+            if self.scaler:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self.optimizer.step()
 
             self.global_step += 1
             self.scheduler.step()

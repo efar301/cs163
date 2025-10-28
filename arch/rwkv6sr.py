@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.layers import DropPath, to_2tuple, trunc_normal_
-from arch.wkv_6.vrwkv_6_3 import Block as RWKV
+from arch.wkv_6.vrwkv_6_7 import Block as RWKV
 
 
 class Mlp(nn.Module):
@@ -475,7 +475,7 @@ def buildRWKVIR():
 # from fvcore.nn import FlopCountAnalysis, parameter_count_table
 
 if __name__ == '__main__':
-    upscale = 4
+    upscale = 2
     height = 20
     width = 20
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -490,7 +490,7 @@ if __name__ == '__main__':
     print(pred.shape)
     print("x on:", x.device)
     print("model param on:", next(model.parameters()).device)
-    print(f"number of model parameters: {sum(param.numel() for param in model.parameters())/1e6}M")
+    print(f"number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
 #     flops = FlopCountAnalysis(model, x)
 #     print("FLOPs: ", flops.total())
