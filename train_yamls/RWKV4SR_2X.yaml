@@ -10,14 +10,14 @@ model:
   residual_groups: 4
   resi_connection: 3conv
   upsampler: pixelshuffledirect
-  embed_dim: 48
+  embed_dim: 64
   patch_size: 8
 
-  checkpoint_dir: ./checkpoints/2X_RWKV4_8SR
+  checkpoint_dir: ./checkpoints/2X_RWKV4_9SR_lite_higherlr
 
 optimizer:
   name: adam
-  lr: 0.0002
+  lr: 0.0003 # lite higher lr was 0.0005
   betas: [0.9, 0.99]
 
   # name: adamw
@@ -36,7 +36,7 @@ data:
   train_dataset_dirs: [./training_data/DIV2K_train_HR, ./training_data/Flickr2K]
   scale: 2
   patch_size: [48, 48]
-  batch_size: 16 # may need to change based on gpu memory
+  batch_size: 32 # may need to change based on gpu memory
   num_workers: 4 # may need to change based on gpu memoryqq               
   persist_workers: true
   pin_memory: true
@@ -46,12 +46,12 @@ trainer:
   num_iterations: 500000
   log_freq: 100
   logging: true
-  checkpoint_freq: 10000
-  resume: false
+  checkpoint_freq: 5000
+  resume: true
 
 wandb:
   entity: farns301
   project: RWKVSR
-  run_name: rwkv4_8sr_2x
+  run_name: rwkv4_9sr_2x_lite 
   resume: allow
-  id: 'run_44_2x'
+  id: 'run_50_2x' # lite higher lr was run_48_2x

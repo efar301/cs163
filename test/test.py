@@ -1,27 +1,64 @@
+import os
+from test_utils import *
 import torch
+import yaml
+import argparse
+from arch.rwkv4srlite import RWKVIR
 from torchvision.transforms import v2 as T
 from torchvision.io import read_image
-import yaml
-
-
-import sys
-import os
-import argparse
-
 import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
-from arch.rwkv4sr import RWKVIR
-# from arch.rwkv6sr import RWKVIR
+def tensor_to_uint8(img_tensor):
+    """
+    Expect tensor in [0,1] (float32/float16), shape C×H×W or H×W×C.
+    Returns np.uint8 array in [0,255].
+    """
+    img = img_tensor.detach().cpu()
+    if img.dim() == 3 and img.shape[0] in (1, 3):
+        img = img.permute(1, 2, 0)  # CHW → HWC
+    img = img.clamp(0, 1).mul(255).round()
+    img = img.numpy().astype(np.uint8)
+    return img[..., ::-1]
 
-def main(args):
-    config = f'train_yamls/RWKV{args.rwkv}SR_2X.yaml'
-    with open(config, 'r') as f:
+
+def test():
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, required=True)
+    parser.add_argument('--iter', type=str, required=True)
+    args = parser.parse_args()
+
+    with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
-    state_dict = torch.load(f'checkpoints/{args.scale}X_RWKV{args.rwkv}_{args.version}SR/iteration_{args.iter}.pt')
-    iteration = state_dict['iteration']
+    # get all image pairs
+    lr_test_folder = config['lr_folder']
+    hr_test_folder = config['hr_folder']
+
+    dataset_names = os.listdir(lr_test_folder)
+    scales = config['scales']
+
+    dataset_pairs = {}
+
+
+    
+    for dataset_name in dataset_names:
+        for scale in scales:
+            lr_folder = os.path.join(lr_test_folder, dataset_name, scale)
+            hr_folder = os.path.join(hr_test_folder, dataset_name, scale)
+            lr_images = sorted(os.listdir(lr_folder))
+            hr_images = sorted(os.listdir(hr_folder))
+            image_pairs = []
+            for lr_image in lr_images:
+                hr_img_name = lr_image.replace(f'_LRBI_', '_HR_')
+                if hr_img_name in hr_images:
+                    image_pairs.append((os.path.join(lr_folder, lr_image), os.path.join(hr_folder, hr_img_name)))
+            dataset_pairs[f'{dataset_name}_{scale}'] = image_pairs
+    
+    # print(dataset_pairs['Set5_x2'])
+    device = 'cuda'
     model_config = config['model']
     depths = [model_config['blocks_per_layer']] * model_config['residual_groups']
     model = RWKVIR(
@@ -29,44 +66,62 @@ def main(args):
         depths=depths,
         mlp_ratio=3.,
         patch_size=model_config['patch_size'],
-        img_range=1,
         embed_dim=model_config['embed_dim'],
         upscale=model_config['scale'],
-        upsampler='pixelshuffledirect',
-        resi_connection=model_config['resi_connection']#,
-        # n_head=model_config['num_heads']
-    ).to(device='cuda')
-    model.load_state_dict(state_dict['model_state_dict'])
+        upsampler=model_config['upsampler'],
+        resi_connection=model_config['resi_connection']
+    )
+    model = model.to(device)
+    checkpoint = torch.load(os.path.join(config['checkpoint_folder'], f'iteration_{args.iter}.pt'), map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
-    img = None
-    if args.img:
-        img = read_image(f'training_data/{args.img}.png')
-    else: 
-        img = read_image('training_data/test.png')
 
-    img = img[:3, :, :]
-    img = T.ToDtype(torch.float32, scale=True)(img)
-    img = img.unsqueeze(0).to(device='cuda')
-    original_shape = img.shape
+    ssims = []
+    psnrs = []
+    for dataset_scale in dataset_pairs.keys():
+        image_pairs = dataset_pairs[dataset_scale]
+        current_scale = int(dataset_scale.split('_')[-1].replace('x', ''))
+        # (lr, hr)
+        dataset_ssims = []
+        dataset_psnrs = []
+        for image_pair in image_pairs:
+            lr = read_image(image_pair[0])
+            lr = T.ToDtype(torch.float32, scale=True)(lr)
+            lr = lr.unsqueeze(0)  # add batch dimension
+            lr = lr.to(device)
 
-    pred = model(img)
+            hr = read_image(image_pair[1])
+            hr = T.ToDtype(torch.float32, scale=True)(hr)
+        
 
-    output_shape = pred.shape
+            with torch.no_grad():
+                predicted = model(lr)
+                predicted = predicted.squeeze(0)
 
-    to_pil = T.ToPILImage()
-    final = to_pil(pred.squeeze(0))
-    final.save(f'test_outputs/iteration_{iteration}_{args.version}_{args.rwkv}.png')
+            predicted_arr = tensor_to_uint8(predicted)
+            hr_arr = tensor_to_uint8(hr)
 
-    print(f'iteration evaluated: {iteration} | input dim = {original_shape} | output dim = {output_shape} | scale = {args.scale}')
+            ssim = calculate_ssim(predicted_arr, hr_arr, crop_border=current_scale, input_order='HWC', test_y_channel=True)
+            psnr = calculate_psnr(predicted_arr, hr_arr, crop_border=current_scale, input_order='HWC', test_y_channel=True)
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--scale', type=int, required=True, help='scale')
-parser.add_argument('--iter', type=int, required=True, help='iter')
-parser.add_argument('--img', type=str, required=False, help='img to test')
-parser.add_argument('--version', type=str, required=True, help='version')
-parser.add_argument('--rwkv', type=str, required=True, help='use rwkv6 or rwkv4')
-args = parser.parse_args()
+            dataset_ssims.append(ssim)
+            dataset_psnrs.append(psnr)
+
+        avg_ssim = sum(dataset_ssims) / len(dataset_ssims)
+        avg_psnr = sum(dataset_psnrs) / len(dataset_psnrs)
+
+        print(f'Dataset: {dataset_scale}, PSNR: {avg_psnr:.4f},  SSIM: {avg_ssim:.4f}')
+        ssims.append(avg_ssim)
+        psnrs.append(avg_psnr)
+
+            
+
+            
+
+
+        
+
 
 if __name__ == '__main__':
-    main(args)
+    test()

@@ -5,7 +5,7 @@ import wandb
 from tqdm import tqdm
 from data.get_loader import get_loader
 import yaml
-from arch.rwkv4sr import RWKVIR
+from arch.rwkv4srlite import RWKVIR
 # from arch.rwkv6sr import RWKVIR
 from typing import Optional, Dict, Any
 from torch.profiler import profile, record_function, ProfilerActivity

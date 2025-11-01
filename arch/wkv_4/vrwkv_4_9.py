@@ -72,7 +72,6 @@ def q_shift(input, shift_pixel=1, gamma=1/4, patch_resolution=None):
 class OmniShift(nn.Module):
     def __init__(self, dim):
         super(OmniShift, self).__init__()
-
         self.conv1x1 = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=1, groups=dim, bias=False)
         self.conv3x3 = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, groups=dim, bias=False)
         self.conv5x5 = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=5, padding=2, groups=dim, bias=False) 
@@ -82,7 +81,6 @@ class OmniShift(nn.Module):
         out1x1 = self.conv1x1(x)
         out3x3 = self.conv3x3(x)
         out5x5 = self.conv5x5(x) 
-        
         
         out = self.alpha[0]*x + self.alpha[1]*out1x1 + self.alpha[2]*out3x3 + self.alpha[3]*out5x5
         return out
@@ -108,6 +106,8 @@ class VRWKV_SpatialMix(nn.Module):
             self.spatial_mix_v = None
             self.spatial_mix_r = None
 
+        self.omni_shift = OmniShift(n_embd)
+
         self.key = nn.Linear(n_embd, attn_sz, bias=False)
         self.value = nn.Linear(n_embd, attn_sz, bias=False)
         self.receptance = nn.Linear(n_embd, attn_sz, bias=False)
@@ -124,31 +124,6 @@ class VRWKV_SpatialMix(nn.Module):
         self.value.scale_init = 1
 
     def _init_weights(self, init_mode):
-        # if init_mode=='fancy':
-        #     with torch.no_grad(): # fancy init
-        #         ratio_0_to_1 = (self.layer_id / (self.n_layer - 1)) # 0 to 1
-        #         ratio_1_to_almost0 = (1.0 - (self.layer_id / self.n_layer)) # 1 to ~0
-                
-        #         # fancy time_decay
-        #         decay_speed = torch.ones(self.n_embd)
-        #         for h in range(self.n_embd):
-        #             decay_speed[h] = -5 + 8 * (h / (self.n_embd-1)) ** (0.7 + 1.3 * ratio_0_to_1)
-        #         self.spatial_decay = nn.Parameter(decay_speed)
-
-        #         # fancy time_first
-        #         zigzag = (torch.tensor([(i+1)%3 - 1 for i in range(self.n_embd)]) * 0.5)
-        #         self.spatial_first = nn.Parameter(torch.ones(self.n_embd) * math.log(0.3) + zigzag)
-                
-        #         # fancy time_mix
-        #         x = torch.ones(1, 1, self.n_embd)
-        #         for i in range(self.n_embd):
-        #             x[0, 0, i] = i / self.n_embd
-        #         self.spatial_mix_k = nn.Parameter(torch.pow(x, ratio_1_to_almost0))
-        #         self.spatial_mix_v = nn.Parameter(torch.pow(x, ratio_1_to_almost0) + 0.3 * ratio_0_to_1)
-        #         self.spatial_mix_r = nn.Parameter(torch.pow(x, 0.5 * ratio_1_to_almost0))
-
-        # else:
-        #     raise NotImplementedError
         if init_mode == 'fancy':
             with torch.no_grad():
                 ratio_0_to_1 = self.layer_id / (self.n_layer - 1)
@@ -174,8 +149,6 @@ class VRWKV_SpatialMix(nn.Module):
                 self.spatial_mix_v = nn.Parameter(mix_v)
                 self.spatial_mix_r = nn.Parameter(mix_r)
         elif init_mode=='local':
-            # self.spatial_decay = nn.Parameter(torch.ones(self.n_embd))
-            # self.spatial_first = nn.Parameter(torch.ones(self.n_embd))
             self.spatial_mix_k = nn.Parameter(torch.ones([1, 1, self.n_embd]))
             self.spatial_mix_v = nn.Parameter(torch.ones([1, 1, self.n_embd]))
             self.spatial_mix_r = nn.Parameter(torch.ones([1, 1, self.n_embd]))
@@ -188,15 +161,24 @@ class VRWKV_SpatialMix(nn.Module):
     def jit_func(self, x, patch_resolution):
         # Mix x with the previous timestep to produce xk, xv, xr
         B, T, C = x.size()
-        if self.shift_pixel > 0:
-            xx = self.shift_func(x, self.shift_pixel, self.channel_gamma, patch_resolution)
-            xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
-            xv = x * self.spatial_mix_v + xx * (1 - self.spatial_mix_v)
-            xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
-        else:
-            xk = x
-            xv = x
-            xr = x
+        H, W = patch_resolution
+        # if self.shift_pixel > 0:
+        #     xx = self.shift_func(x, self.shift_pixel, self.channel_gamma, patch_resolution)
+        #     xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
+        #     xv = x * self.spatial_mix_v + xx * (1 - self.spatial_mix_v)
+        #     xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
+        # else:
+        #     xk = x
+        #     xv = x
+        #     xr = x
+        x = rearrange(x, 'b (h w) c -> b c h w', h=H, w=W)
+        xx = self.omni_shift(x)
+        x = rearrange(x, 'b c h w -> b (h w) c', h=H, w=W)
+        xx = rearrange(xx, 'b c h w -> b (h w) c', h=H, w=W)
+        xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
+        xv = x * self.spatial_mix_v + xx * (1 - self.spatial_mix_v)
+        xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
+
 
         # Use xk, xv, xr to produce k, v, r
         k = self.key(xk)
@@ -212,7 +194,6 @@ class VRWKV_SpatialMix(nn.Module):
         self.device = x.device
 
         sr, k, v = self.jit_func(x, patch_resolution)
-        # rwkv = RUN_CUDA(self.spatial_decay / T, self.spatial_first / T, k, v)
 
         # row major scan
         v1 = RUN_CUDA(self.spatial_decay[0] / T, self.spatial_first[0] / T, k, v)
@@ -247,6 +228,8 @@ class VRWKV_ChannelMix(nn.Module):
         else:
             self.spatial_mix_k = None
             self.spatial_mix_r = None
+            
+        self.omni_shift = OmniShift(n_embd)
 
         hidden_sz = hidden_rate * n_embd
         self.key = nn.Linear(n_embd, hidden_sz, bias=False)
@@ -281,13 +264,22 @@ class VRWKV_ChannelMix(nn.Module):
             raise NotImplementedError
 
     def forward(self, x, patch_resolution=None):
-        if self.shift_pixel > 0:
-            xx = self.shift_func(x, self.shift_pixel, self.channel_gamma, patch_resolution)
-            xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
-            xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
-        else:
-            xk = x
-            xr = x
+        # if self.shift_pixel > 0:
+        #     xx = self.shift_func(x, self.shift_pixel, self.channel_gamma, patch_resolution)
+        #     xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
+        #     xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
+        # else:
+        #     xk = x
+        #     xr = x
+
+        B, T, C = x.size()
+        H, W = patch_resolution
+        x = rearrange(x, 'b (h w) c -> b c h w', h=H, w=W)
+        xx = self.omni_shift(x)
+        x = rearrange(x, 'b c h w -> b (h w) c', h=H, w=W)
+        xx = rearrange(xx, 'b c h w -> b (h w) c', h=H, w=W)
+        xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
+        xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)       
 
         k = self.key(xk)
         k = torch.square(torch.relu(k))
