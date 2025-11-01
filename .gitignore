@@ -4,6 +4,7 @@
 # everything else should be committed
 
 /training_data
+/testing_data
 *.pyc
 __pycache__
 wandb

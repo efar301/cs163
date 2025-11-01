@@ -1,0 +1,17 @@
+scales: ['x2']
+
+lr_folder: 'testing_data/LR/LRBI/'
+hr_folder: 'testing_data/HR/'
+checkpoint_folder: checkpoints\2X_RWKV4_9SR_lite_higherlr
+
+model:
+  name: RWKVSR
+  scale: 2
+  in_channels: 3
+  num_channels: 64
+  blocks_per_layer: 6
+  residual_groups: 4
+  resi_connection: 3conv
+  upsampler: pixelshuffledirect
+  embed_dim: 64
+  patch_size: 8
