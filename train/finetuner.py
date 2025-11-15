@@ -34,7 +34,7 @@ def _tensor_to_uint8(img_tensor: torch.Tensor):
     img = img.clamp(0, 1).mul(255).round().to(torch.uint8).contiguous()
     return img.numpy()[..., ::-1]
 
-class Trainer():
+class Finetuner():
     def __init__(self, config_dir: str) -> None:
         self.config = self._load_config(config_dir)
         self._seed_everything(self.config['seed'])
@@ -56,14 +56,15 @@ class Trainer():
 
         
         self.checkpoint_dir = self.config['model']['checkpoint_dir']
-        self.checkpoint_freq = self.config['trainer']['checkpoint_freq']
-        self.log_freq = self.config['trainer']['log_freq']
+        self.checkpoint_freq = self.config['finetuner']['checkpoint_freq']
+        self.log_freq = self.config['finetuner']['log_freq']
         self.checkpoint_dir = self.config['model']['checkpoint_dir']
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.global_step = 0
         self.start_iteration = 0
         self.lr_milestones = list(self.config['scheduler'].get('lr_milestones', []))
         self.lr_gamma = float(self.config['scheduler'].get('lr_gamma', 0.5))
+        self.ft_milestones = list(self.config.get('finetuning', {}).get('lr_milestones', []))
 
         self.model = self._init_model()
         self.optimizer = self._init_optimizer()
@@ -71,11 +72,11 @@ class Trainer():
         self.scheduler = self._init_scheduler()
         self._setup_amp()
 
-        if self.config['trainer']['logging']:
+        if self.config['finetuner']['logging']:
             self._log_init()
 
         resume_path = None
-        if self.config['trainer']['resume']:
+        if self.config['finetuner']['resume']:
             resume_path = self._get_latest_checkpoint(self.checkpoint_dir)
         if resume_path:
             self._load_checkpoint(resume_path)
@@ -105,13 +106,46 @@ class Trainer():
         if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
-    
+
     def _get_latest_checkpoint(self, checkpoint_dir: str) -> Optional[str]:
         checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pt')]
         if not checkpoint_files:
             return None
         checkpoint_files.sort(key=lambda x: int(x.split('_')[1].split('.')[0]), reverse=True)
         return os.path.join(checkpoint_dir, checkpoint_files[0])
+
+
+    def _init_optimizer(self) -> None:
+        opt_config = self.config['optimizer']
+
+        lr = opt_config['lr']
+
+        name = opt_config['name'].lower()
+        if name == 'adam':
+            betas = tuple(opt_config.get('betas'))
+            print(f'optimizer: {name} initialized successfully')
+            return torch.optim.Adam(self.model.parameters(), 
+                                    lr=lr, 
+                                    betas=betas)
+        if name == 'adamw':
+            betas = tuple(opt_config.get('betas'))
+            weight_decay = float(opt_config.get('weight_decay', 0.01))
+            print(f'optimizer: {name} initialized successfully')
+            return torch.optim.AdamW(self.model.parameters(), 
+                                     lr=lr, 
+                                     betas=betas,
+                                     weight_decay=weight_decay)
+        
+        raise ValueError(f"Optimizer not defined in _init_optimizer(): {opt_config['name']}")
+
+    def _init_scheduler(self) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
+        
+        milestones = [int (milestone) for milestone in self.lr_milestones]
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer,
+                                                            milestones=milestones,
+                                                            gamma=self.lr_gamma)
+        print('scheduler initialized successfully')
+        return scheduler
 
     def _init_model(self) -> None:
         model_config = self.config['model']
@@ -129,49 +163,19 @@ class Trainer():
         )
         return model.to(self.device)
 
-    def _init_optimizer(self) -> None:
-        opt_config = self.config['optimizer']
-        name = opt_config['name'].lower()
-        if name == 'adam':
-            betas = tuple(opt_config.get('betas'))
-            print(f'optimizer: {name} initialized successfully')
-            return torch.optim.Adam(self.model.parameters(), 
-                                    lr=opt_config['lr'], 
-                                    betas=betas)
-        if name == 'adamw':
-            betas = tuple(opt_config.get('betas'))
-            weight_decay = float(opt_config.get('weight_decay', 0.01))
-            print(f'optimizer: {name} initialized successfully')
-            return torch.optim.AdamW(self.model.parameters(), 
-                                     lr=opt_config['lr'], 
-                                     betas=betas,
-                                     weight_decay=weight_decay)
-        
-        raise ValueError(f"Optimizer not defined in _init_optimizer(): {opt_config['name']}")
-    
-    def _init_scheduler(self) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
-        if self.lr_milestones:
-            milestones = [int (milestone) for milestone in self.lr_milestones]
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer,
-                                                             milestones=milestones,
-                                                             gamma=self.lr_gamma)
-            print('scheduler initialized successfully')
-            return scheduler
-        return None
-    
     def _log_init(self) -> None:
         self.run = wandb.init(
             entity=self.config['wandb']['entity'],
             project=self.config['wandb']['project'],
             name=self.config['wandb']['run_name'],
             id=self.config['wandb']['id'],
-            resume=self.config['wandb']['resume'],
+            resume=self.config['wandb']['resume']
         )
         wandb.watch(self.model, 
                     log='gradients', 
-                    log_freq=self.config['trainer']['log_freq'])
+                    log_freq=self.config['finetuner']['log_freq'])
         print('wandb initialized successfully')
-        
+
     def log(self, loss: float, lr: float, psnr: float, ssim: float) -> None:
         self.run.log({'loss': loss, 'lr': lr, 'psnr': psnr, 'ssim': ssim})
 
@@ -275,15 +279,16 @@ class Trainer():
         self.model.train()
         return results
 
-    def train(self) -> None:
+    def finetune(self) -> None:
         num_parameters = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f'model has {num_parameters} trainable parameters')
         print(f'device used for training: {self.device}')
-        print('starting training...')
-        num_iterations = self.config['trainer']['num_iterations']
+        print('starting finetuning...')
+
+        num_iterations = self.config['finetuner']['num_iterations']
 
         remaining = max(0, num_iterations - self.global_step)
-        pbar = tqdm(total=remaining, desc=f'Iteration {self.global_step}/{num_iterations}')
+        pbar = tqdm(ncols=140, total=remaining, desc=f'Iteration {self.global_step}/{num_iterations}')
 
         while self.global_step < num_iterations:
             self.model.train()
@@ -312,15 +317,13 @@ class Trainer():
                 with torch.no_grad():
                     results = self.benchmark(datasets=['Set5'], scales=[f'x{self.config["model"]["scale"]}'])
                     dataset, scale, psnr, ssim = results[0]
-                if self.config['trainer']['logging']:
+                if self.config['finetuner']['logging']:
                     self.log(loss.item(), current_lr, psnr, ssim)
 
                 pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{current_lr:.6f}', 'psnr': f'{psnr:.4f}', 'ssim': f'{ssim:.4f}'})
             if self.global_step % self.checkpoint_freq == 0:
                 self.checkpoint(self.global_step)
             pbar.update(1)
-
-
 
     def checkpoint(self, iteration: int) -> None:
         state = {
@@ -329,25 +332,30 @@ class Trainer():
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
-            'config': self.config
+            'finetuning': True
         }
 
         path = self.checkpoint_dir + '/' + f'iteration_{iteration}.pt'
         torch.save(state, path)
-        print(f'checkpoint saved at {path} successfully')
-    
+        print(f'\ncheckpoint saved at {path} successfully')
+
     def _load_checkpoint(self, checkpoint_dir: str) -> None:
         checkpoint = torch.load(checkpoint_dir, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        self.start_iteration = checkpoint.get("iteration", 0)
-        self.global_step = checkpoint.get("global_step", 0)
-        print(f'checkpoint loaded from {checkpoint_dir} successfully, resuming from iteration {self.start_iteration}')
 
+        if not checkpoint.get('finetuning'):
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            # self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            # self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            self.start_iteration = 0
+            self.global_step = 0
+            print(f'checkpoint loaded from {checkpoint_dir} successfully, beginning finetune from iteration {self.start_iteration}')
+        else:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            self.start_iteration = checkpoint.get('iteration', 0)
+            self.global_step = checkpoint.get('global_step', 0)
+            print(f'checkpoint loaded from {checkpoint_dir} successfully, resuming finetuning from iteration {self.start_iteration}')
 
+        
 
-
-    
-
-    

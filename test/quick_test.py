@@ -12,29 +12,39 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
-from arch.rwkv4srlite import RWKVIR
-# from arch.rwkv6sr import RWKVIR
+# from arch.rwkv4srlite3 import RWKVIR
+from arch.rwkv6srlite2 import RWKVIR
 
 def main(args):
     config = f'train_yamls/RWKV{args.rwkv}SR_2X.yaml'
     with open(config, 'r') as f:
         config = yaml.safe_load(f)
 
-    state_dict = torch.load(f'checkpoints/{args.scale}X_RWKV{args.rwkv}_{args.version}SR_lite_higherlr/iteration_{args.iter}.pt')
+    state_dict = torch.load(f'checkpoints/{args.scale}X_RWKV{args.rwkv}_{args.version}SR_longertrain2/iteration_{args.iter}.pt')
     iteration = state_dict['iteration']
     model_config = config['model']
     depths = [model_config['blocks_per_layer']] * model_config['residual_groups']
+    # model = RWKVIR(
+    #     img_size=model_config['patch_size'],
+    #     depths=depths,
+    #     hidden_rate=model_config['hidden_rate'],
+    #     patch_size=model_config['patch_size'],
+    #     img_range=1,
+    #     embed_dim=model_config['embed_dim'],
+    #     upscale=model_config['scale'],
+    #     upsampler='pixelshuffledirect',
+    #     resi_connection=model_config['resi_connection']#,
+    #     # n_head=model_config['num_heads']
+    # ).to(device='cuda')
     model = RWKVIR(
         img_size=model_config['patch_size'],
         depths=depths,
-        mlp_ratio=3.,
+        hidden_rate=model_config['hidden_rate'],
         patch_size=model_config['patch_size'],
         img_range=1,
         embed_dim=model_config['embed_dim'],
         upscale=model_config['scale'],
-        upsampler='pixelshuffledirect',
-        resi_connection=model_config['resi_connection']#,
-        # n_head=model_config['num_heads']
+        n_head=model_config['num_heads']
     ).to(device='cuda')
     model.load_state_dict(state_dict['model_state_dict'], strict=False)
     model.eval()
@@ -43,7 +53,7 @@ def main(args):
     if args.img:
         img = read_image(f'training_data/{args.img}.png')
     else: 
-        img = read_image('testing_data/LR/LRBI/Urban100/x2/img_004_LRBI_x2.png')
+        img = read_image('training_data/test.png')
 
     img = img[:3, :, :]
     img = T.ToDtype(torch.float32, scale=True)(img)
