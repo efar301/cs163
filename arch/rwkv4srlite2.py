@@ -10,7 +10,6 @@ import torch.utils.checkpoint as checkpoint
 from timm.layers import to_2tuple, trunc_normal_
 from arch.wkv_4.vrwkv_4_9 import Block as RWKV
 from einops import rearrange
-from einops.layers.torch import Rearrange, Reduce
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -69,39 +68,6 @@ class ChannelShuffle(nn.Module):
         assert c % g == 0
         x = x.view(b, t, g, c // g).transpose(2, 3).contiguous()
         return x.view(b, t, c)
-    
-class SqueezeExcitation(nn.Module):
-    def __init__(self, dim, shrinkage_rate = 0.25):
-        super().__init__()
-        hidden_dim = int(dim * shrinkage_rate)
-
-        self.gate = nn.Sequential(
-            Reduce('b c h w -> b c', 'mean'),
-            nn.Linear(dim, hidden_dim, bias = False),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, dim, bias = False),
-            nn.Sigmoid(),
-            Rearrange('b c -> b c 1 1')
-        )
-
-    def forward(self, x):
-        return x * self.gate(x)
-    
-class MBConv(nn.Module):
-    def __init__(self, dim, expansion_rate=4, shrinkage_rate=0.25):
-        super().__init__()
-        hidden_dim = int(dim * expansion_rate)
-        self.net = nn.Sequential(
-            nn.Conv2d(dim, hidden_dim, kernel_size=1, stride=1, padding=0),
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1, groups=hidden_dim),
-            nn.GELU(),
-            SqueezeExcitation(hidden_dim, shrinkage_rate),
-            nn.Conv2d(hidden_dim, dim, kernel_size=1, stride=1, padding=0),
-        )
-
-    def forward(self, x):
-        return self.net(x) + x
 
 class RWKVBlock(nn.Module):  # Add CNN block here for the RWKV improevment
     def __init__(self, dim, input_resolution, n_layer, layer_id, shift_mode='q_shift', init_mode='local',
@@ -190,12 +156,11 @@ class RWKVB(nn.Module):
         if resi_connection == '1conv':
             self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
         elif resi_connection == '3conv':
-            pass
             # to save parameters and memory
-            # self.conv = nn.Sequential(nn.Conv2d(dim, dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-            #                           nn.Conv2d(dim // 4, dim // 4, 1, 1, 0),
-            #                           nn.LeakyReLU(negative_slope=0.2, inplace=True),
-            #                           nn.Conv2d(dim // 4, dim, 3, 1, 1))
+            self.conv = nn.Sequential(nn.Conv2d(dim, dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                      nn.Conv2d(dim // 4, dim // 4, 1, 1, 0),
+                                      nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                      nn.Conv2d(dim // 4, dim, 3, 1, 1))
 
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim,
@@ -205,7 +170,6 @@ class RWKVB(nn.Module):
             img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim,
             norm_layer=None)
 
-        self.mbconv = MBConv(dim, expansion_rate=2, shrinkage_rate=1/4)
         self.channel_shuffle = ChannelShuffle(groups=4)
         self.esa = ESA(dim, nn.Conv2d)
 
@@ -213,8 +177,7 @@ class RWKVB(nn.Module):
         # return self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x, x_size), x_size))) + x
         shortcut = x
         x = self.patch_unembed(x, x_size)
-        # x = self.conv(x)
-        x = self.mbconv(x)
+        x = self.conv(x)
         x = self.patch_embed(x)
         shortcut2 = x
         x = self.channel_shuffle(x, x_size)
@@ -251,6 +214,11 @@ class RWKVIR(nn.Module):
         self.upscale = upscale
         self.upsampler = upsampler
         # self.window_size = window_size
+        self.mixer = nn.Conv2d(embed_dim * (len(depths) + 1), embed_dim, kernel_size=1, stride=1, padding=0)
+        self.refinement = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=1, padding=1, groups=embed_dim)
+        )
 
         #####################################################################################################
         ################################### 1, shallow feature extraction ###################################
@@ -352,14 +320,6 @@ class RWKVIR(nn.Module):
 
         self.apply(self._init_weights)
 
-    # def _init_weights(self, m):
-    #     if isinstance(m, nn.Linear):
-    #         trunc_normal_(m.weight, std=.02)
-    #         if isinstance(m, nn.Linear) and m.bias is not None:
-    #             nn.init.constant_(m.bias, 0)
-    #     elif isinstance(m, nn.LayerNorm):
-    #         nn.init.constant_(m.bias, 0)
-    #         nn.init.constant_(m.weight, 1.0)
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             if getattr(m, 'init_scale', 1) == 0:
@@ -387,11 +347,17 @@ class RWKVIR(nn.Module):
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
         
+        layer_outputs = []
         for layer in self.layers:
             x = layer(x, x_size)
+            layer_outputs.append(rearrange(x, 'b (h w) c -> b c h w', h=x_size[0], w=x_size[1]))
 
         x = self.norm(x)  # B L C
-        x = self.patch_unembed(x, x_size)
+        x = self.patch_unembed(x, x_size) # B C H W
+        x = torch.cat([*layer_outputs, x], dim=1)
+        x = self.mixer(x)
+        x = nn.GELU()(x)
+        x = self.refinement(x)
 
         return x
 
@@ -565,8 +531,8 @@ if __name__ == '__main__':
     height = 100
     width = 200
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = RWKVIR(img_size=(height, width), depths=[6, 6, 6, 6, 6], 
-                   hidden_rate=3, patch_size=8,
+    model = RWKVIR(img_size=(height, width), depths=[6, 6, 6, 6], 
+                   hidden_rate=4, patch_size=8,
                    img_range=1, embed_dim=64, upscale=upscale,
                    upsampler='pixelshuffledirect', resi_connection='3conv',).to(device)
     

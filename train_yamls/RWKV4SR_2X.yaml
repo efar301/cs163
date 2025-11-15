@@ -7,13 +7,14 @@ model:
   in_channels: 3
   num_channels: 64
   blocks_per_layer: 6
-  residual_groups: 4
+  residual_groups: 5
   resi_connection: 3conv
   upsampler: pixelshuffledirect
   embed_dim: 64
   patch_size: 8
+  hidden_rate: 3
 
-  checkpoint_dir: ./checkpoints/2X_RWKV4_9SR_lite_higherlr
+  checkpoint_dir: ./checkpoints/2X_RWKV4_11SR_lite_higherlr
 
 optimizer:
   name: adam
@@ -29,20 +30,22 @@ optimizer:
 
 scheduler:
   lr_milestones: [250000, 400000, 450000, 475000]
+  # lr_milestones: [200000, 400000, 600000, 800000]
   lr_gamma: 0.5
 
 data:
   train_datasets: ['DIV2K', 'Flickr2K']
   train_dataset_dirs: [./training_data/DIV2K_train_HR, ./training_data/Flickr2K]
   scale: 2
-  patch_size: [48, 48]
-  batch_size: 32 # may need to change based on gpu memory
+  patch_size: [64, 64]
+  batch_size: 16 # may need to change based on gpu memory
   num_workers: 4 # may need to change based on gpu memoryqq               
   persist_workers: true
   pin_memory: true
   prefetch_factor: 4
 
 trainer:
+
   num_iterations: 500000
   log_freq: 100
   logging: true
@@ -51,7 +54,7 @@ trainer:
 
 wandb:
   entity: farns301
-  project: RWKVSR
-  run_name: rwkv4_9sr_2x_lite 
+  project: RWKVSR-3
+  run_name: rwkv4_11sr_2x_lite_higherlr
   resume: allow
-  id: 'run_50_2x' # lite higher lr was run_48_2x
+  id: 'run_1_2x' # lite higher lr was run_48_2x

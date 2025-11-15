@@ -1,12 +1,15 @@
 import os
-from test_utils import *
+from common.test_utils import *
 import torch
 import yaml
 import argparse
-from arch.rwkv4srlite import RWKVIR
+# from arch.rwkv4srlite3 import RWKVIR
+from arch.rwkv6srlite2 import RWKVIR
 from torchvision.transforms import v2 as T
 from torchvision.io import read_image
+import time
 import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
@@ -61,15 +64,25 @@ def test():
     device = 'cuda'
     model_config = config['model']
     depths = [model_config['blocks_per_layer']] * model_config['residual_groups']
+    # model = RWKVIR(
+    #     img_size=model_config['patch_size'],
+    #     depths=depths,
+    #     hidden_rate=model_config['hidden_rate'],
+    #     patch_size=model_config['patch_size'],
+    #     embed_dim=model_config['embed_dim'],
+    #     upscale=model_config['scale'],
+    #     upsampler=model_config['upsampler'],
+    #     resi_connection=model_config['resi_connection']
+    # )
     model = RWKVIR(
         img_size=model_config['patch_size'],
         depths=depths,
-        mlp_ratio=3.,
+        hidden_rate=model_config['hidden_rate'],
         patch_size=model_config['patch_size'],
+        img_range=1,
         embed_dim=model_config['embed_dim'],
         upscale=model_config['scale'],
-        upsampler=model_config['upsampler'],
-        resi_connection=model_config['resi_connection']
+        n_head=model_config['num_heads']
     )
     model = model.to(device)
     checkpoint = torch.load(os.path.join(config['checkpoint_folder'], f'iteration_{args.iter}.pt'), map_location=device)
@@ -85,6 +98,7 @@ def test():
         # (lr, hr)
         dataset_ssims = []
         dataset_psnrs = []
+        start = time.time()
         for image_pair in image_pairs:
             lr = read_image(image_pair[0])
             lr = T.ToDtype(torch.float32, scale=True)(lr)
@@ -107,11 +121,12 @@ def test():
 
             dataset_ssims.append(ssim)
             dataset_psnrs.append(psnr)
+        end = time.time()
 
         avg_ssim = sum(dataset_ssims) / len(dataset_ssims)
         avg_psnr = sum(dataset_psnrs) / len(dataset_psnrs)
 
-        print(f'Dataset: {dataset_scale}, PSNR: {avg_psnr:.4f},  SSIM: {avg_ssim:.4f}')
+        print(f'Dataset: {dataset_scale}, PSNR: {avg_psnr:.4f},  SSIM: {avg_ssim:.4f}, Time: {end - start:.2f}s')
         ssims.append(avg_ssim)
         psnrs.append(avg_psnr)
 

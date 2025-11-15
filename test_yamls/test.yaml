@@ -2,16 +2,30 @@ scales: ['x2']
 
 lr_folder: 'testing_data/LR/LRBI/'
 hr_folder: 'testing_data/HR/'
-checkpoint_folder: checkpoints\2X_RWKV4_9SR_lite_higherlr
+# checkpoint_folder: checkpoints\2X_RWKV4_11SR_lite_higherlr
+checkpoint_folder: checkpoints\2X_RWKV6_9SR_longertrain2
 
-model:
+# model:
+#   name: RWKVSR
+#   scale: 2
+#   in_channels: 3
+#   num_channels: 64
+#   blocks_per_layer: 6
+#   residual_groups: 5
+#   resi_connection: 3conv
+#   upsampler: pixelshuffledirect
+#   embed_dim: 64
+#   patch_size: 8
+#   hidden_rate: 3
+
+model: # v2 had embed_dim: 48, num_heads: 6
   name: RWKVSR
   scale: 2
   in_channels: 3
   num_channels: 64
-  blocks_per_layer: 6
-  residual_groups: 4
-  resi_connection: 3conv
-  upsampler: pixelshuffledirect
+  blocks_per_layer: 1
+  residual_groups: 3
+  hidden_rate: 3
   embed_dim: 64
+  num_heads: 8
   patch_size: 8

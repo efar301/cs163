@@ -8,27 +8,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.layers import to_2tuple, trunc_normal_
-from arch.wkv_4.vrwkv_4_9 import Block as RWKV
-from einops import rearrange
+from arch.wkv_4.vrwkv_4_11 import Block as RWKV
 from einops.layers.torch import Rearrange, Reduce
+from einops import rearrange
 
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
+def mean_channels(F):
+    assert(F.dim() == 4)
+    spatial_sum = F.sum(3, keepdim=True).sum(2, keepdim=True)
+    return spatial_sum / (F.size(2) * F.size(3))
 
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
+def stdv_channels(F):
+    assert(F.dim() == 4)
+    F_mean = mean_channels(F)
+    F_variance = (F - F_mean).pow(2).sum(3, keepdim=True).sum(2, keepdim=True) / (F.size(2) * F.size(3))
+    return F_variance.pow(0.5)
 
 # ESA from HNCT
 class ESA(nn.Module):
@@ -58,17 +51,25 @@ class ESA(nn.Module):
         m = self.sigmoid(c4)
 
         return x * m
+    
+class CCALayer(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(CCALayer, self).__init__()
 
-class ChannelShuffle(nn.Module):
-    def __init__(self, groups=2):
-        super().__init__()
-        self.groups = groups
-    def forward(self, x, patch_resolution=None):
-        b, t, c = x.shape
-        g = self.groups
-        assert c % g == 0
-        x = x.view(b, t, g, c // g).transpose(2, 3).contiguous()
-        return x.view(b, t, c)
+        self.contrast = stdv_channels
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv_du = nn.Sequential(
+            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
+
+
+    def forward(self, x):
+        y = self.contrast(x) + self.avg_pool(x)
+        y = self.conv_du(y)
+        return x * y
     
 class SqueezeExcitation(nn.Module):
     def __init__(self, dim, shrinkage_rate = 0.25):
@@ -88,30 +89,48 @@ class SqueezeExcitation(nn.Module):
         return x * self.gate(x)
     
 class MBConv(nn.Module):
-    def __init__(self, dim, expansion_rate=4, shrinkage_rate=0.25):
+    def __init__(self, dim, expansion_rate=4):
         super().__init__()
         hidden_dim = int(dim * expansion_rate)
         self.net = nn.Sequential(
-            nn.Conv2d(dim, hidden_dim, kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(dim, hidden_dim, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1, groups=hidden_dim),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim),
             nn.GELU(),
-            SqueezeExcitation(hidden_dim, shrinkage_rate),
-            nn.Conv2d(hidden_dim, dim, kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(hidden_dim, dim, kernel_size=1),
         )
 
     def forward(self, x):
-        return self.net(x) + x
+        return self.net(x)
+    
+class eca_layer(nn.Module):
+    """Constructs a ECA module.
+
+    Args:
+        channel: Number of channels of the input feature map
+        k_size: Adaptive selection of kernel size
+    """
+    def __init__(self, k_size=3):
+        super(eca_layer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False) 
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        return x * y.expand_as(x)
+
+
 
 class RWKVBlock(nn.Module):  # Add CNN block here for the RWKV improevment
-    def __init__(self, dim, input_resolution, n_layer, layer_id, shift_mode='q_shift', init_mode='local',
-                channel_gamma=1/4, shift_pixel=1, drop_path=0., hidden_rate=4,
+    def __init__(self, dim, input_resolution, n_layer, layer_id, drop_path=0., hidden_rate=4,
                 init_values=None, post_norm=False, key_norm=False, with_cp=False,
                 mlp_ratio=3., drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         
-        self.RWKV = RWKV(n_embd=dim, n_layer=n_layer, layer_id=layer_id, channel_gamma=channel_gamma, shift_mode=shift_mode, init_mode=init_mode,
-                        shift_pixel=shift_pixel, drop_path=drop_path, hidden_rate=hidden_rate,
+        self.RWKV = RWKV(n_embd=dim, n_layer=n_layer, layer_id=layer_id, drop_path=drop_path, hidden_rate=hidden_rate,
                         init_values=init_values, post_norm=post_norm, key_norm=key_norm, with_cp=with_cp)
         # self.RWKV = RWKV(n_embd=dim, n_layer=n_layer, layer_id=layer_id, hidden_rate=4, init_mode='local', key_norm=key_norm)
     def forward(self, x, patch_resolution):
@@ -123,8 +142,7 @@ class RWKVBlock(nn.Module):  # Add CNN block here for the RWKV improevment
         
 
 class BasicLayer(nn.Module): 
-    def __init__(self, dim, input_resolution, depth, n_layer, layer_id, shift_mode='q_shift', init_mode='local',
-                channel_gamma=1/4, shift_pixel=1, drop_path=0., hidden_rate=4,
+    def __init__(self, dim, input_resolution, depth, n_layer, layer_id, drop_path=0., hidden_rate=4,
                 init_values=None, post_norm=False, key_norm=False, with_cp=False,
                 mlp_ratio=3., drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
 
@@ -137,7 +155,6 @@ class BasicLayer(nn.Module):
         # build blocks
         self.blocks = nn.ModuleList([
             RWKVBlock(dim=dim, input_resolution=input_resolution, n_layer=n_layer, layer_id=layer_id,
-                    shift_mode=shift_mode, init_mode=init_mode, channel_gamma=channel_gamma, shift_pixel=shift_pixel,
                     drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path, 
                     hidden_rate=hidden_rate, init_values=init_values,
                     post_norm=post_norm, key_norm=key_norm, with_cp=with_cp,
@@ -163,8 +180,7 @@ class BasicLayer(nn.Module):
 
 
 class RWKVB(nn.Module):
-    def __init__(self, dim, input_resolution, depth, n_layer, layer_id, shift_mode='q_shift', init_mode='local',
-                channel_gamma=1/4, shift_pixel=1, drop_path=0., hidden_rate=4,
+    def __init__(self, dim, input_resolution, depth, n_layer, layer_id, drop_path=0., hidden_rate=4,
                 init_values=None, post_norm=False, key_norm=False, with_cp=False,
                 mlp_ratio=3., drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
                 img_size=224, patch_size=4, resi_connection='1conv'):
@@ -173,29 +189,31 @@ class RWKVB(nn.Module):
         self.dim = dim
         self.input_resolution = input_resolution
 
-        self.residual_group = BasicLayer(dim=dim // 2,
-                                         input_resolution=input_resolution,
-                                         depth=depth,
-                                         n_layer=n_layer,
-                                         layer_id=layer_id, shift_mode=shift_mode, init_mode=init_mode,
-                                         channel_gamma=channel_gamma, shift_pixel=shift_pixel,
-                                         drop_path=drop_path, hidden_rate=hidden_rate,
-                                         init_values=init_values, post_norm=post_norm,
-                                         key_norm=key_norm, with_cp=with_cp,
-                                         mlp_ratio=mlp_ratio, drop=drop, act_layer=act_layer,
-                                         norm_layer=norm_layer,
-                                         downsample=downsample,
-                                         use_checkpoint=use_checkpoint)
+        self.block1 = RWKVBlock(dim=dim, input_resolution=input_resolution, n_layer=n_layer, layer_id=layer_id,
+                    drop_path=drop_path[0], 
+                    hidden_rate=hidden_rate, init_values=init_values,
+                    post_norm=post_norm, key_norm=key_norm, with_cp=with_cp,
+                    mlp_ratio=mlp_ratio, drop=drop, act_layer=act_layer, norm_layer=norm_layer)
+        
+        self.block2 = RWKVBlock(dim=dim//2, input_resolution=input_resolution, n_layer=n_layer, layer_id=layer_id,
+                    drop_path=drop_path[0], 
+                    hidden_rate=hidden_rate, init_values=init_values,
+                    post_norm=post_norm, key_norm=key_norm, with_cp=with_cp,
+                    mlp_ratio=mlp_ratio, drop=drop, act_layer=act_layer, norm_layer=norm_layer)
+        
+        self.block3 = RWKVBlock(dim=dim//4, input_resolution=input_resolution, n_layer=n_layer, layer_id=layer_id,
+                    drop_path=drop_path[0], 
+                    hidden_rate=hidden_rate, init_values=init_values,
+                    post_norm=post_norm, key_norm=key_norm, with_cp=with_cp,
+                    mlp_ratio=mlp_ratio, drop=drop, act_layer=act_layer, norm_layer=norm_layer)
 
-        if resi_connection == '1conv':
-            self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
-        elif resi_connection == '3conv':
-            pass
-            # to save parameters and memory
-            # self.conv = nn.Sequential(nn.Conv2d(dim, dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-            #                           nn.Conv2d(dim // 4, dim // 4, 1, 1, 0),
-            #                           nn.LeakyReLU(negative_slope=0.2, inplace=True),
-            #                           nn.Conv2d(dim // 4, dim, 3, 1, 1))
+        self.conv1 = MBConv(dim, expansion_rate=2)
+        self.conv2 = MBConv(dim//2, expansion_rate=2)
+        self.conv3 = MBConv(dim//4, expansion_rate=2)
+        self.mixer = nn.Conv2d(dim, dim, 1, 1, 0)
+        self.cca = CCALayer(dim)
+        self.esa = ESA(dim, nn.Conv2d)
+
 
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim,
@@ -205,34 +223,41 @@ class RWKVB(nn.Module):
             img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim,
             norm_layer=None)
 
-        self.mbconv = MBConv(dim, expansion_rate=2, shrinkage_rate=1/4)
-        self.channel_shuffle = ChannelShuffle(groups=4)
-        self.esa = ESA(dim, nn.Conv2d)
+        
 
     def forward(self, x, x_size):  # x_size need to be used
-        # return self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x, x_size), x_size))) + x
+        H, W = x_size
         shortcut = x
-        x = self.patch_unembed(x, x_size)
-        # x = self.conv(x)
-        x = self.mbconv(x)
-        x = self.patch_embed(x)
-        shortcut2 = x
-        x = self.channel_shuffle(x, x_size)
-        shortcut2 = x
-        x1, x2 = torch.chunk(x, 2, dim=2)
-        x1 = self.residual_group(x1, x_size)
-        x = torch.cat([x1, x2], dim=2)
-        x = self.patch_unembed(x, x_size)
-        x = self.esa(x)
-        x = self.patch_embed(x)
-        x = x + shortcut + shortcut2
-        return x
+        shortcut = rearrange(shortcut, 'b (h w) c -> b c h w', h=H, w=W)
+        x1 = rearrange(x, 'b (h w) c -> b c h w', h=H, w=W)
+        x1 = self.conv1(x1)
+        x1 = rearrange(x1, 'b c h w -> b (h w) c')
+        x1 = self.block1(x1, x_size)
+        x2, res1 = torch.chunk(x1, 2, dim=2)
+
+        x2 = rearrange(x2, 'b (h w) c -> b c h w', h=H, w=W)
+        x2 = self.conv2(x2)
+        x2 = rearrange(x2, 'b c h w -> b (h w) c')
+        x2 = self.block2(x2, x_size)
+        x3, res2 = torch.chunk(x2, 2, dim=2)
+
+        x3 = rearrange(x3, 'b (h w) c -> b c h w', h=H, w=W)
+        x3 = self.conv3(x3)
+        x3 = rearrange(x3, 'b c h w -> b (h w) c')
+        x3 = self.block3(x3, x_size)
+
+        comb = torch.cat([res1, res2, x3], dim=2) 
+        comb = rearrange(comb, 'b (h w) c -> b c h w', h=H, w=W)
+        comb = self.mixer(comb)
+        comb = self.cca(comb)
+        comb = comb + shortcut
+        comb = self.esa(comb)
+        comb = rearrange(comb, 'b c h w -> b (h w) c')
+        return comb
 
 class RWKVIR(nn.Module):
     def __init__(self, img_size=64, patch_size=1, in_chans=3,
-                 embed_dim=64, depths=[6, 6, 6, 6], mlp_ratio=3.,
-                 shift_mode='q_shift', init_mode='local',
-                 channel_gamma=1/4, shift_pixel=1, hidden_rate=4,
+                 embed_dim=64, depths=[6, 6, 6, 6], mlp_ratio=3., hidden_rate=4,
                  init_values=None, post_norm=False, key_norm=False, with_cp=False,
                  drop_rate=0.0, drop_path_rate=0.1, act_layer=nn.GELU,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
@@ -301,8 +326,7 @@ class RWKVIR(nn.Module):
                          patch_size=patch_size,
                          resi_connection=resi_connection,
                          n_layer=self.num_layers,
-                         layer_id=i_layer, shift_mode=shift_mode, init_mode=init_mode,
-                         channel_gamma=channel_gamma, shift_pixel=shift_pixel, 
+                         layer_id=i_layer, 
                          hidden_rate=hidden_rate,
                          init_values=init_values, post_norm=post_norm, 
                          key_norm=key_norm, with_cp=with_cp,
@@ -314,52 +338,21 @@ class RWKVIR(nn.Module):
         self.norm = norm_layer(self.num_features)
 
         # build the last conv layer in deep feature extraction
-        if resi_connection == '1conv':
-            self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
-        elif resi_connection == '3conv':
-            # to save parameters and memory
-            self.conv_after_body = nn.Sequential(nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1),
-                                                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                                 nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0),
-                                                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                                 nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1))
+        self.conv_after_body = nn.Sequential(nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1),
+                                             nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                             nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0),
+                                             nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                             nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1))
 
         #####################################################################################################
         ################################ 3, high quality image reconstruction ################################
-        if self.upsampler == 'pixelshuffle':
-            # for classical SR
-            self.conv_before_upsample = nn.Sequential(nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
-                                                      nn.LeakyReLU(inplace=True))
-            self.upsample = Upsample(upscale, num_feat)
-            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
-        elif self.upsampler == 'pixelshuffledirect':
+
             # for lightweight SR (to save parameters)
-            self.upsample = UpsampleOneStep(upscale, embed_dim, num_out_ch,
-                                            (patches_resolution[0], patches_resolution[1]))
-        elif self.upsampler == 'nearest+conv':
-            # for real-world SR (less artifacts)
-            self.conv_before_upsample = nn.Sequential(nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
-                                                      nn.LeakyReLU(inplace=True))
-            self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-            if self.upscale == 4:
-                self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-            self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
-            self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        else:
-            # for image denoising and JPEG compression artifact reduction
-            self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
+        self.upsample = UpsampleOneStep(upscale, embed_dim, num_out_ch, (patches_resolution[0], patches_resolution[1]))
+
 
         self.apply(self._init_weights)
 
-    # def _init_weights(self, m):
-    #     if isinstance(m, nn.Linear):
-    #         trunc_normal_(m.weight, std=.02)
-    #         if isinstance(m, nn.Linear) and m.bias is not None:
-    #             nn.init.constant_(m.bias, 0)
-    #     elif isinstance(m, nn.LayerNorm):
-    #         nn.init.constant_(m.bias, 0)
-    #         nn.init.constant_(m.weight, 1.0)
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             if getattr(m, 'init_scale', 1) == 0:
@@ -402,31 +395,13 @@ class RWKVIR(nn.Module):
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
 
-        if self.upsampler == 'pixelshuffle':
-            # for classical SR
-            x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.conv_before_upsample(x)
-            x = self.conv_last(self.upsample(x))
-        elif self.upsampler == 'pixelshuffledirect':
-            # for lightweight SR
-            x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.upsample(x)
-        elif self.upsampler == 'nearest+conv':
-            # for real-world SR
-            x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.conv_before_upsample(x)
-            x = self.lrelu(self.conv_up1(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
-            if self.upscale == 4:
-                x = self.lrelu(self.conv_up2(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
-            x = self.conv_last(self.lrelu(self.conv_hr(x)))
-        else:
-            # for image denoising and JPEG compression artifact reduction
-            x_first = self.conv_first(x)
-            res = self.conv_after_body(self.forward_features(x_first)) + x_first
-            x = x + self.conv_last(res)
+        # shallow feature extraction
+        x = self.conv_first(x)
+
+        # deep feature extraction + conv
+        x = self.conv_after_body(self.forward_features(x)) + x
+        # high quality image reconstruction
+        x = self.upsample(x)
 
         x = x / self.img_range + self.mean
 
