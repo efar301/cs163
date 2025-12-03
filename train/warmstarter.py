@@ -61,7 +61,7 @@ class SpecialLoss(nn.Module):
         return l1_loss + fft_loss
 
 
-class Finetuner():
+class WarmStarter():
     def __init__(self, config_dir: str) -> None:
         self.config = self._load_config(config_dir)
         self._seed_everything(self.config['seed'])
@@ -83,8 +83,8 @@ class Finetuner():
 
         
         self.checkpoint_dir = self.config['model']['checkpoint_dir']
-        self.checkpoint_freq = self.config['finetuner']['checkpoint_freq']
-        self.log_freq = self.config['finetuner']['log_freq']
+        self.checkpoint_freq = self.config['trainer']['checkpoint_freq']
+        self.log_freq = self.config['trainer']['log_freq']
         self.checkpoint_dir = self.config['model']['checkpoint_dir']
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.global_step = 0
@@ -94,22 +94,21 @@ class Finetuner():
         self.ft_milestones = list(self.config.get('finetuning', {}).get('lr_milestones', []))
 
         self.model = self._init_model()
+        # self._freeze_params()
         self.optimizer = self._init_optimizer()
         # self.criterion = nn.L1Loss()
         self.criterion = SpecialLoss()
         self.scheduler = self._init_scheduler()
         self._setup_amp()
 
-        if self.config['finetuner']['logging']:
+        if self.config['trainer']['logging']:
             self._log_init()
 
         resume_path = None
-        if self.config['finetuner']['resume']:
+        if self.config['trainer']['resume']:
             resume_path = self._get_latest_checkpoint(self.checkpoint_dir)
         if resume_path:
             self._load_checkpoint(resume_path)
-            # self._init_scheduler()
-            # self._init_optimizer()
 
     def _seed_everything(self, seed: int):
         torch.manual_seed(seed)
@@ -147,12 +146,16 @@ class Finetuner():
 
     def _init_optimizer(self) -> None:
         opt_config = self.config['optimizer']
+
         lr = opt_config['lr']
+
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+
         name = opt_config['name'].lower()
         if name == 'adam':
             betas = tuple(opt_config.get('betas'))
             print(f'optimizer: {name} initialized successfully')
-            return torch.optim.Adam(self.model.parameters(), 
+            return torch.optim.Adam(trainable_params, 
                                     lr=lr, 
                                     betas=betas)
         
@@ -181,6 +184,15 @@ class Finetuner():
             with_cp=model_config['with_cp']
         )
         return model.to(self.device)
+    
+    def _freeze_params(self) -> None:
+        for name, param in self.model.named_parameters():
+            if name.startswith('upsample'):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+        print('parameters frozen successfully')
 
     def _log_init(self) -> None:
         self.run = wandb.init(
@@ -192,7 +204,7 @@ class Finetuner():
         )
         wandb.watch(self.model, 
                     log='gradients', 
-                    log_freq=self.config['finetuner']['log_freq'])
+                    log_freq=self.config['trainer']['log_freq'])
         print('wandb initialized successfully')
 
     def log(self, loss: float, lr: float, psnr: float, ssim: float) -> None:
@@ -298,13 +310,13 @@ class Finetuner():
         self.model.train()
         return results
 
-    def finetune(self) -> None:
+    def warmstart(self) -> None:
         num_parameters = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f'model has {num_parameters} trainable parameters')
         print(f'device used for training: {self.device}')
         print('starting finetuning...')
 
-        num_iterations = self.config['finetuner']['num_iterations']
+        num_iterations = self.config['trainer']['num_iterations']
 
         remaining = max(0, num_iterations - self.global_step)
         pbar = tqdm(ncols=140, total=remaining, desc=f'Iteration {self.global_step}/{num_iterations}')
@@ -336,7 +348,7 @@ class Finetuner():
                 with torch.no_grad():
                     results = self.benchmark(datasets=['Set5'], scales=[f'x{self.config["model"]["scale"]}'])
                     dataset, scale, psnr, ssim = results[0]
-                if self.config['finetuner']['logging']:
+                if self.config['trainer']['logging']:
                     self.log(loss.item(), current_lr, psnr, ssim)
 
                 pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{current_lr:.6f}', 'psnr': f'{psnr:.4f}', 'ssim': f'{ssim:.4f}'})
@@ -351,7 +363,8 @@ class Finetuner():
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
-            'finetuning': True
+            'finetuning': True,
+            'warmstart': True
         }
 
         path = self.checkpoint_dir + '/' + f'iteration_{iteration}.pt'
@@ -360,22 +373,33 @@ class Finetuner():
 
     def _load_checkpoint(self, checkpoint_dir: str) -> None:
         checkpoint = torch.load(checkpoint_dir, map_location=self.device)
+        state_dict = checkpoint['model_state_dict']
+        is_warmstart = bool(checkpoint.get('warmstart'))
 
-        if ('finetuning' in checkpoint) and (checkpoint['finetuning'] is False):
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-            # self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            # self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if not is_warmstart:
+            body_state_dict = {
+                k: v for k, v in state_dict.items()
+                if not k.startswith('upsample')
+            }
+
+            missing, unexpected = self.model.load_state_dict(body_state_dict, strict=False)
+
             self.start_iteration = 0
-
             self.global_step = 0
-            print(f'checkpoint loaded from {checkpoint_dir} successfully, beginning finetune from iteration {self.start_iteration}')
+            print(
+                f'checkpoint loaded from {checkpoint_dir} successfully, '
+                f'beginning upsample-only finetune from iteration {self.start_iteration}'
+            )
         else:
-            self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
             self.start_iteration = checkpoint.get('iteration', 0)
             self.global_step = checkpoint.get('global_step', 0)
-            print(f'checkpoint loaded from {checkpoint_dir} successfully, resuming finetuning from iteration {self.start_iteration}')
-
-        
+            print(
+                f'checkpoint loaded from {checkpoint_dir} successfully, '
+                f'resuming finetuning from iteration {self.start_iteration}'
+            )
 

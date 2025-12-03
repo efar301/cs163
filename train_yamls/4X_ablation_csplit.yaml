@@ -1,0 +1,49 @@
+seed: 12
+device: null
+
+model: 
+  name: IDRWKV
+  scale: 4
+  in_channels: 3
+  num_blocks: 3
+  hidden_rate: 3
+  embed_dim: 64
+  num_heads: 8
+  patch_size: 8
+  with_cp: false
+  checkpoint_dir: ./checkpoints/4X_csplit
+
+
+optimizer:
+  name: adam
+  lr: 0.0005
+  betas: [0.9, 0.99]
+  
+scheduler:
+  lr_milestones: [200000]
+  lr_gamma: 0.5
+
+data:
+  train_datasets: ['DIV2K', 'Flickr2K']
+  train_dataset_dirs: [./training_data/DIV2K_train_HR, ./training_data/Flickr2K]
+  scale: 4
+  patch_size: [48, 48]
+  batch_size: 16 # may need to change based on gpu memory
+  num_workers: 4 # may need to change based on gpu memory
+  persist_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+
+trainer:
+  num_iterations: 100000
+  log_freq: 100
+  logging: true
+  checkpoint_freq: 10000
+  resume: true
+
+wandb:
+  entity: farns301
+  project: IDRWKV_ablation
+  run_name: csplit
+  resume: allow
+  id: 'csplit'

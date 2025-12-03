@@ -6,8 +6,8 @@ import wandb
 from tqdm import tqdm
 from data.get_loader import get_loader
 import yaml
-# from arch.rwkv4srlite3 import RWKVIR
-from arch.rwkv6srlite2 import RWKVIR
+from arch.idrwkv import IDRWKV
+# from arch.dirwkvs import IDRWKV
 from typing import Optional, Dict, Any, Iterable, List, Tuple
 from torch.profiler import profile, record_function, ProfilerActivity
 from torchvision.io import read_image
@@ -33,6 +33,34 @@ def _tensor_to_uint8(img_tensor: torch.Tensor):
         img = img.permute(1, 2, 0)
     img = img.clamp(0, 1).mul(255).round().to(torch.uint8).contiguous()
     return img.numpy()[..., ::-1]
+
+class FFTLoss(nn.Module):
+    def __init__(self, loss_weight=1.0, reduction='mean'):
+        super(FFTLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.criterion = torch.nn.L1Loss(reduction=reduction)
+
+    def forward(self, pred, target):
+        pred_fft = torch.fft.rfft2(pred)
+        target_fft = torch.fft.rfft2(target)
+
+        pred_fft = torch.stack([pred_fft.real, pred_fft.imag], dim=-1)
+        target_fft = torch.stack([target_fft.real, target_fft.imag], dim=-1)
+
+        return self.loss_weight * self.criterion(pred_fft, target_fft)
+    
+class SpecialLoss(nn.Module):
+    def __init__(self, loss_weight=1.0, reduction='mean'):
+        super(SpecialLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.criterion = nn.L1Loss(reduction=reduction)
+        self.fft_criterion = FFTLoss(loss_weight=0.01)
+
+    def forward(self, pred, target):
+        l1_loss = self.loss_weight * self.criterion(pred, target)
+        fft_loss = self.fft_criterion(pred, target)
+        return l1_loss + fft_loss
+
 
 class Trainer():
     def __init__(self, config_dir: str) -> None:
@@ -67,7 +95,8 @@ class Trainer():
 
         self.model = self._init_model()
         self.optimizer = self._init_optimizer()
-        self.criterion = nn.L1Loss()
+        # self.criterion = nn.L1Loss()
+        self.criterion = SpecialLoss()
         self.scheduler = self._init_scheduler()
         self._setup_amp()
 
@@ -115,10 +144,9 @@ class Trainer():
 
     def _init_model(self) -> None:
         model_config = self.config['model']
-        depths = [model_config['blocks_per_layer']] * model_config['residual_groups']
-        model = RWKVIR(
+        model = IDRWKV(
             img_size=model_config['patch_size'],
-            depths=depths,
+            num_blocks=model_config['num_blocks'],
             hidden_rate=model_config['hidden_rate'],
             patch_size=model_config['patch_size'],
             img_range=1,
@@ -138,14 +166,6 @@ class Trainer():
             return torch.optim.Adam(self.model.parameters(), 
                                     lr=opt_config['lr'], 
                                     betas=betas)
-        if name == 'adamw':
-            betas = tuple(opt_config.get('betas'))
-            weight_decay = float(opt_config.get('weight_decay', 0.01))
-            print(f'optimizer: {name} initialized successfully')
-            return torch.optim.AdamW(self.model.parameters(), 
-                                     lr=opt_config['lr'], 
-                                     betas=betas,
-                                     weight_decay=weight_decay)
         
         raise ValueError(f"Optimizer not defined in _init_optimizer(): {opt_config['name']}")
     
@@ -165,13 +185,13 @@ class Trainer():
             project=self.config['wandb']['project'],
             name=self.config['wandb']['run_name'],
             id=self.config['wandb']['id'],
-            resume=self.config['wandb']['resume'],
+            resume=self.config['wandb']['resume']
         )
         wandb.watch(self.model, 
                     log='gradients', 
                     log_freq=self.config['trainer']['log_freq'])
         print('wandb initialized successfully')
-        
+
     def log(self, loss: float, lr: float, psnr: float, ssim: float) -> None:
         self.run.log({'loss': loss, 'lr': lr, 'psnr': psnr, 'ssim': ssim})
 
@@ -283,7 +303,7 @@ class Trainer():
         num_iterations = self.config['trainer']['num_iterations']
 
         remaining = max(0, num_iterations - self.global_step)
-        pbar = tqdm(total=remaining, desc=f'Iteration {self.global_step}/{num_iterations}')
+        pbar = tqdm(ncols=140, total=remaining, desc=f'Iteration {self.global_step}/{num_iterations}')
 
         while self.global_step < num_iterations:
             self.model.train()
@@ -334,11 +354,11 @@ class Trainer():
 
         path = self.checkpoint_dir + '/' + f'iteration_{iteration}.pt'
         torch.save(state, path)
-        print(f'checkpoint saved at {path} successfully')
+        print(f'\ncheckpoint saved at {path} successfully')
     
     def _load_checkpoint(self, checkpoint_dir: str) -> None:
         checkpoint = torch.load(checkpoint_dir, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.start_iteration = checkpoint.get("iteration", 0)
