@@ -12,3 +12,6 @@ wandb
 checkpoints
 test_outputs
 .DS_Store
+cuda_v4
+cuda_new
+arch/old

@@ -3,8 +3,12 @@ from common.test_utils import *
 import torch
 import yaml
 import argparse
-# from arch.rwkv4srlite3 import RWKVIR
-from arch.rwkv6srlite2 import RWKVIR
+
+# from arch.idrwkv import IDRWKV
+# from arch.idrwkv_csplit import IDRWKV
+# from arch.idrwkv import IDRWKV
+
+
 from torchvision.transforms import v2 as T
 from torchvision.io import read_image
 import time
@@ -25,7 +29,6 @@ def tensor_to_uint8(img_tensor):
     img = img.numpy().astype(np.uint8)
     return img[..., ::-1]
 
-
 def test():
 
     parser = argparse.ArgumentParser()
@@ -36,6 +39,11 @@ def test():
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
+    if config['model_type'] == 'IDRWKV':
+        from arch.idrwkv import IDRWKV
+    elif config['model_type'] == 'CSPLIT':
+        from arch.idrwkv_csplit import IDRWKV   
+
     # get all image pairs
     lr_test_folder = config['lr_folder']
     hr_test_folder = config['hr_folder']
@@ -44,8 +52,6 @@ def test():
     scales = config['scales']
 
     dataset_pairs = {}
-
-
     
     for dataset_name in dataset_names:
         for scale in scales:
@@ -63,20 +69,10 @@ def test():
     # print(dataset_pairs['Set5_x2'])
     device = 'cuda'
     model_config = config['model']
-    depths = [model_config['blocks_per_layer']] * model_config['residual_groups']
-    # model = RWKVIR(
-    #     img_size=model_config['patch_size'],
-    #     depths=depths,
-    #     hidden_rate=model_config['hidden_rate'],
-    #     patch_size=model_config['patch_size'],
-    #     embed_dim=model_config['embed_dim'],
-    #     upscale=model_config['scale'],
-    #     upsampler=model_config['upsampler'],
-    #     resi_connection=model_config['resi_connection']
-    # )
-    model = RWKVIR(
+
+    model = IDRWKV(
         img_size=model_config['patch_size'],
-        depths=depths,
+        num_blocks=model_config['num_blocks'],
         hidden_rate=model_config['hidden_rate'],
         patch_size=model_config['patch_size'],
         img_range=1,
@@ -86,9 +82,10 @@ def test():
     )
     model = model.to(device)
     checkpoint = torch.load(os.path.join(config['checkpoint_folder'], f'iteration_{args.iter}.pt'), map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
     model.eval()
 
+    print(f'Model tested: {config["model_type"]} | iteration: {args.iter}')
 
     ssims = []
     psnrs = []

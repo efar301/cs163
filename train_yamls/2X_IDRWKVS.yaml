@@ -1,0 +1,48 @@
+seed: 12
+device: null
+
+model: 
+  name: IDRWKV
+  scale: 2
+  in_channels: 3
+  num_blocks: 8
+  hidden_rate: 4
+  embed_dim: 32
+  num_heads: 4
+  patch_size: 8
+  with_cp: false
+  checkpoint_dir: ./checkpoints/2X_IDRWKVS_3
+
+optimizer:
+  name: adam
+  lr: 0.002
+  betas: [0.9, 0.99]
+  
+scheduler:
+  lr_milestones: [100000, 500000, 800000, 900000, 950000] 
+  lr_gamma: 0.5
+
+data:
+  train_datasets: ['DIV2K', 'Flickr2K']
+  train_dataset_dirs: [./training_data/DIV2K_train_HR, ./training_data/Flickr2K]
+  scale: 2
+  patch_size: [64, 64]
+  batch_size: 8 # may need to change based on gpu memory
+  num_workers: 4 # may need to change based on gpu memory
+  persist_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+
+trainer:
+  num_iterations: 1000000
+  log_freq: 100
+  logging: true
+  checkpoint_freq: 10000
+  resume: true
+
+wandb:
+  entity: farns301
+  project: IDRWKVS_2X
+  run_name: IDRWKVS_4
+  resume: allow
+  id: 'run_4_2x'
